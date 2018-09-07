@@ -284,7 +284,7 @@ function loadClientListeners () {
 
   global.botTMI.chat.on('MODE', async (message) => {
     DEBUG_TMIJS('User ' + (message.isModerator ? '+mod' : '-mod') + ' ' + message.username)
-    const user = await global.users.get(message.username)
+    const user = await global.users.getByName(message.username)
     if (!user.is.mod && message.isModerator) global.events.fire('mod', { username: message.username })
     global.users.set(message.username, { is: { mod: message.isModerator } })
 

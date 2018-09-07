@@ -12,7 +12,7 @@ class Module {
     this._settings = {}
     this._commands = []
     this._parsers = []
-    this._name = opts.name || 'library'
+    this._name = opts.name || 'core'
 
     this.collection = new Proxy({}, {
       get: (target, name, receiver) => {
@@ -66,7 +66,7 @@ class Module {
         })
         socket.on('settings.update', async (data, cb) => {
           for (let [key, value] of Object.entries(data)) {
-            if (key === 'enabled' && this._name === 'library') continue
+            if (key === 'enabled' && this._name === 'core') continue
             else if (key === '_permissions') {
               for (let [command, currentValue] of Object.entries(value)) {
                 command = this._commands.find(o => o.name === command)
@@ -277,7 +277,7 @@ class Module {
 
   async status (opts) {
     opts = opts || {}
-    if (this._name === 'library') return true
+    if (this._name === 'core') return true
 
     const areDependenciesEnabled = await this._dependenciesEnabled()
     const isMasterAndStatusOnly = cluster.isMaster && _.isNil(opts.state)

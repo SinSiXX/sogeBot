@@ -1,54 +1,297 @@
+// @flow
+
 'use strict'
 
 var _ = require('lodash')
 var constants = require('./constants')
-const XRegExp = require('xregexp')
 const cluster = require('cluster')
 
 const config = require('@config')
-const debug = require('debug')('users')
 const Timeout = require('./timeout')
+const Expects = require('./expects')
+const Core = require('./_interface')
 
-function Users () {
-  this.timeouts = {}
+class Users extends Core {
+  uiSortCache: String | null = null
+  uiSortCacheViewers: Array<Object> = []
 
-  this.uiSortCache = null
-  this.uiSortCacheViewers = []
+  constructor () {
+    const settings = {
+      commands: [
+        { name: '!regular add', fnc: 'addRegular', permission: constants.OWNER_ONLY },
+        { name: '!regular remove', fnc: 'rmRegular', permission: constants.OWNER_ONLY },
+        { name: '!ignore add', fnc: 'ignoreAdd', permission: constants.OWNER_ONLY },
+        { name: '!ignore rm', fnc: 'ignoreRm', permission: constants.OWNER_ONLY },
+        { name: '!ignore check', fnc: 'ignoreCheck', permission: constants.OWNER_ONLY },
+        { name: '!me', fnc: 'showMe', permission: constants.VIEWERS }
+      ]
+    }
 
-  if (cluster.isMaster) {
-    this.panel()
-    this.compactMessagesDb()
-    this.compactWatchedDb()
-    this.updateWatchTime(new Date())
+    super({ settings })
 
-    // set all users offline on start
-    global.db.engine.remove('users.online', {})
+    this.addMenu({ category: 'manage', name: 'viewers', id: 'viewers/list' })
+    this.addMenu({ category: 'settings', name: 'core', id: 'core' })
+
+    if (cluster.isMaster) {
+      this.compactMessagesDb()
+      this.compactWatchedDb()
+      this.updateWatchTime()
+
+      // set all users offline on start
+      global.db.engine.remove('users.online', {})
+    }
+  }
+
+  async ignoreAdd (opts: Object) {
+    try {
+      const username = new Expects(opts.parameters).username().toArray()[0].toLowerCase()
+      await global.db.engine.update('users_ignorelist', { username }, { username })
+      // update ignore list
+      global.commons.processAll({ ns: 'commons', fnc: 'loadIgnoreList' })
+      global.commons.sendMessage(global.commons.prepare('ignore.user.is.added', { username }), opts.sender)
+    } catch (e) {}
+  }
+
+  async ignoreRm (opts: Object) {
+    try {
+      const username = new Expects(opts.parameters).username().toArray()[0].toLowerCase()
+      await global.db.engine.remove('users_ignorelist', { username })
+      // update ignore list
+      global.commons.processAll({ ns: 'commons', fnc: 'loadIgnoreList' })
+      global.commons.sendMessage(global.commons.prepare('ignore.user.is.removed', { username }), opts.sender)
+    } catch (e) {}
+  }
+
+  async ignoreCheck (opts: Object) {
+    try {
+      const username = new Expects(opts.parameters).username().toArray()[0].toLowerCase()
+      const isIgnored = global.commons.isIgnored(username)
+      global.commons.sendMessage(global.commons.prepare(isIgnored ? 'ignore.user.is.ignored' : 'ignore.user.is.not.ignored', { username }), opts.sender)
+      return isIgnored
+    } catch (e) {}
+  }
+
+  async get (username: string) {
+    console.warn('Deprecated: users.get, use getById or getByName')
+    console.warn(new Error().stack)
+    return this.getByName(username)
+  }
+
+  async getByName (username: string) {
+    username = username.toLowerCase()
+
+    let user = await global.db.engine.findOne('users', { username })
+
+    user.username = _.get(user, 'username', username).toLowerCase()
+    user.time = _.get(user, 'time', {})
+    user.is = _.get(user, 'is', {})
+    user.stats = _.get(user, 'stats', {})
+    user.custom = _.get(user, 'custom', {})
+
+    try {
+      if (!_.isNil(user._id)) user._id = user._id.toString() // force retype _id
+      if (_.isNil(user.time.created_at) && !_.isNil(user.id)) { // this is accessing master (in points) and worker
+        if (cluster.isMaster) global.api.fetchAccountAge(username, user.id)
+        else if (process.send) process.send({ type: 'api', fnc: 'fetchAccountAge', username: username, id: user.id })
+      }
+    } catch (e) {
+      global.log.error(e.stack)
+    }
+    return user
+  }
+
+  async getById (id: string) {
+    const user = await global.db.engine.findOne('users', { id })
+    user.id = _.get(user, 'id', id)
+    user.time = _.get(user, 'time', {})
+    user.is = _.get(user, 'is', {})
+    user.stats = _.get(user, 'stats', {})
+    user.custom = _.get(user, 'custom', {})
+
+    try {
+      if (!_.isNil(user._id)) user._id = user._id.toString() // force retype _id
+      if (_.isNil(user.time.created_at) && !_.isNil(user.username)) { // this is accessing master (in points) and worker
+        if (cluster.isMaster) global.api.fetchAccountAge(user.username, user.id)
+        else if (process.send) process.send({ type: 'api', fnc: 'fetchAccountAge', username: user.username, id: user.id })
+      }
+    } catch (e) {
+      global.log.error(e.stack)
+    }
+    return user
+  }
+
+  async getAll (where: Object) {
+    where = where || {}
+    return global.db.engine.find('users', where)
+  }
+
+  async addRegular (opts: Object) {
+    try {
+      const username = new Expects(opts.parameters).username().toArray()[0].toLowerCase()
+
+      const udb = await global.db.engine.findOne('users', { username })
+      if (_.isEmpty(udb)) global.commons.sendMessage(global.commons.prepare('regulars.add.undefined', { username }), opts.sender)
+      else {
+        global.commons.sendMessage(global.commons.prepare('regulars.add.success', { username }), opts.sender)
+        await global.db.engine.update('users', { _id: String(udb._id) }, { is: { regular: true } })
+      }
+    } catch (e) {
+      global.commons.sendMessage(global.commons.prepare('regulars.add.empty'), opts.sender)
+    }
+  }
+
+  async rmRegular (opts: Object) {
+    try {
+      const username = new Expects(opts.parameters).username().toArray()[0].toLowerCase()
+
+      const udb = await global.db.engine.findOne('users', { username })
+      if (_.isEmpty(udb)) global.commons.sendMessage(global.commons.prepare('regulars.rm.undefined', { username }), opts.sender)
+      else {
+        global.commons.sendMessage(global.commons.prepare('regulars.rm.success', { username }), opts.sender)
+        await global.db.engine.update('users', { _id: String(udb._id) }, { is: { regular: false } })
+      }
+    } catch (e) {
+      global.commons.sendMessage(global.commons.prepare('regulars.rm.empty'), opts.sender)
+    }
+  }
+
+  async set (username: string, object: Object) {
+    if (_.isNil(username)) return global.log.error('username is NULL!\n' + new Error().stack)
+
+    username = username.toLowerCase()
+    if (username === config.settings.bot_username.toLowerCase() || _.isNil(username)) return // it shouldn't happen, but there can be more than one instance of a bot
+    return global.db.engine.update('users', { username: username }, object)
+  }
+
+  async updateWatchTime () {
+    let timeout = 60000
+    try {
+      // count watching time when stream is online
+      if (await global.cache.isOnline()) {
+        let users = await global.db.engine.find('users.online')
+        let updated = []
+        for (let onlineUser of users) {
+          updated.push(onlineUser.username)
+          const watched = typeof this.watchedList[onlineUser.username] === 'undefined' ? timeout : new Date().getTime() - new Date(this.watchedList[onlineUser.username]).getTime()
+          await global.db.engine.insert('users.watched', { username: onlineUser.username, watched })
+          this.watchedList[onlineUser.username] = new Date()
+        }
+
+        // remove offline users from watched list
+        for (let u of Object.entries(this.watchedList)) {
+          if (!updated.includes(u[0])) delete this.watchedList[u[0]]
+        }
+      } else throw Error('stream offline')
+    } catch (e) {
+      this.watchedList = {}
+      timeout = 1000
+    }
+    return new Timeout().recursive({ this: this, uid: 'updateWatchTime', wait: timeout, fnc: this.updateWatchTime })
+  }
+
+  async compactWatchedDb () {
+    try {
+      await global.commons.compactDb({ table: 'users.watched', index: 'id', values: 'watched' })
+    } catch (e) {
+      global.log.error(e)
+      global.log.error(e.stack)
+    } finally {
+      new Timeout().recursive({ uid: 'compactWatchedDb', this: this, fnc: this.compactWatchedDb, wait: 10000 })
+    }
+  }
+
+  async getWatchedOf (id: string) {
+    let watched = 0
+    for (let item of await global.db.engine.find('users.watched', { id })) {
+      let itemPoints = !_.isNaN(parseInt(_.get(item, 'watched', 0))) ? _.get(item, 'watched', 0) : 0
+      watched = watched + Number(itemPoints)
+    }
+    if (Number(watched) < 0) watched = 0
+
+    return parseInt(
+      Number(watched) <= Number.MAX_SAFE_INTEGER / 1000000
+        ? watched
+        : Number.MAX_SAFE_INTEGER / 1000000, 10)
+  }
+
+  async compactMessagesDb () {
+    try {
+      await global.commons.compactDb({ table: 'users.messages', index: 'id', values: 'messages' })
+    } catch (e) {
+      global.log.error(e)
+      global.log.error(e.stack)
+    } finally {
+      new Timeout().recursive({ uid: 'compactMessagesDb', this: this, fnc: this.compactMessagesDb, wait: 10000 })
+    }
+  }
+
+  async getMessagesOf (id: string) {
+    let messages = 0
+    for (let item of await global.db.engine.find('users.messages', { id })) {
+      let itemPoints = !_.isNaN(parseInt(_.get(item, 'messages', 0))) ? _.get(item, 'messages', 0) : 0
+      messages = messages + Number(itemPoints)
+    }
+    if (Number(messages) < 0) messages = 0
+
+    return parseInt(
+      Number(messages) <= Number.MAX_SAFE_INTEGER / 1000000
+        ? messages
+        : Number.MAX_SAFE_INTEGER / 1000000, 10)
+  }
+
+  async getUsernamesFromIds (IdsList: Array<string>) {
+    let IdsToUsername = {}
+    for (let id of IdsList) {
+      if (!_.isNil(IdsToUsername[id])) continue // skip if already had map
+      IdsToUsername[id] = (await global.db.engine.findOne('users', { id })).username
+    }
+    return IdsToUsername
+  }
+
+  async getNameById (id: string) {
+    return (await global.db.engine.findOne('users', { id })).username
+  }
+
+  async showMe (opts: Object) {
+    try {
+      var message = ['$sender']
+
+      // rank
+      var rank = await global.systems.ranks.get(opts.sender.username)
+      if (await global.systems.ranks.isEnabled() && !_.isNull(rank)) message.push(rank)
+
+      // watchTime
+      var watched = await global.users.getWatchedOf(opts.sender.userId)
+      message.push((watched / 1000 / 60 / 60).toFixed(1) + 'h')
+
+      // points
+      if (await global.systems.points.isEnabled()) {
+        let userPoints = await global.systems.points.getPointsOf(opts.sender.userId)
+        message.push(userPoints + ' ' + await global.systems.points.getPointsName(userPoints))
+      }
+
+      // message count
+      var messages = await global.users.getMessagesOf(opts.sender.userId)
+      message.push(messages + ' ' + global.commons.getLocalizedName(messages, 'core.messages'))
+
+      // tips
+      const [tips, currency] = await Promise.all([
+        global.db.engine.find('users.tips', { username: opts.sender.username }),
+        global.configuration.getValue('currency')
+      ])
+      let tipAmount = 0
+      for (let t of tips) {
+        tipAmount += global.currency.exchange(t.amount, t.currency, currency)
+      }
+      message.push(`${Number(tipAmount).toFixed(2)} ${currency}`)
+
+      global.commons.sendMessage(message.join(' | '), opts.sender)
+    } catch (e) {
+      global.log.error(e.stack)
+    }
   }
 }
-
-Users.prototype.commands = function () {
-  return [
-    { this: this, id: '!regular add', command: '!regular add', fnc: this.addRegular, permission: constants.OWNER_ONLY },
-    { this: this, id: '!regular remove', command: '!regular remove', fnc: this.rmRegular, permission: constants.OWNER_ONLY },
-    { this: this, id: '!merge', command: '!merge', fnc: this.merge, permission: constants.MODS },
-    { this: this, id: '!ignore add', command: '!ignore add', fnc: this.ignoreAdd, permission: constants.OWNER_ONLY },
-    { this: this, id: '!ignore rm', command: '!ignore rm', fnc: this.ignoreRm, permission: constants.OWNER_ONLY },
-    { this: this, id: '!ignore check', command: '!ignore check', fnc: this.ignoreCheck, permission: constants.OWNER_ONLY }
-  ]
-}
-
-Users.prototype.panel = function () {
-  if (_.isNil(global.panel)) return setTimeout(() => this.panel(), 10)
-
-  global.panel.addMenu({ category: 'manage', name: 'viewers', id: 'viewers' })
-  global.panel.socketListening(this, 'deleteViewer', this.deleteViewer)
-  global.panel.socketListening(this, 'viewers.toggle', this.toggleIs)
-  global.panel.socketListening(this, 'resetMessages', this.resetMessages)
-  global.panel.socketListening(this, 'resetWatchTime', this.resetWatchTime)
-
-  this.sockets()
-}
-
+/*
 Users.prototype.sockets = function (self) {
   const io = global.panel.io.of('/users')
 
@@ -360,51 +603,6 @@ Users.prototype.sockets = function (self) {
     })
   })
 }
-
-Users.prototype.ignoreAdd = async function (opts) {
-  const match = XRegExp.exec(opts.parameters, constants.USERNAME_REGEXP)
-  if (_.isNil(match)) return
-
-  match.username = match.username.toLowerCase()
-
-  await global.db.engine.update('users_ignorelist', { username: match.username }, { username: match.username })
-
-  // update ignore list
-  global.commons.processAll({ ns: 'commons', fnc: 'loadIgnoreList' })
-
-  let message = await global.commons.prepare('ignore.user.is.added', { username: match.username })
-  debug(message); global.commons.sendMessage(message, opts.sender)
-}
-
-Users.prototype.ignoreRm = async function (opts) {
-  const match = XRegExp.exec(opts.parameters, constants.USERNAME_REGEXP)
-  if (_.isNil(match)) return
-
-  match.username = match.username.toLowerCase()
-
-  await global.db.engine.remove('users_ignorelist', { username: match.username })
-  global.commons.processAll({ type: 'call', ns: 'commons', fnc: 'loadIgnoreList' })
-  let message = await global.commons.prepare('ignore.user.is.removed', { username: match.username })
-  debug(message); global.commons.sendMessage(message, opts.sender)
-}
-
-Users.prototype.ignoreCheck = async function (opts) {
-  const match = XRegExp.exec(opts.parameters, constants.USERNAME_REGEXP)
-  if (_.isNil(match)) return
-
-  match.username = match.username.toLowerCase()
-
-  let ignoredUser = await global.db.engine.findOne('users_ignorelist', { username: match.username })
-  let message
-  if (!_.isEmpty(ignoredUser)) {
-    message = await global.commons.prepare('ignore.user.is.ignored', { username: match.username })
-  } else {
-    message = await global.commons.prepare('ignore.user.is.not.ignored', { username: match.username })
-  }
-  debug(message); global.commons.sendMessage(message, opts.sender)
-  return !_.isEmpty(ignoredUser)
-}
-
 Users.prototype.resetMessages = function (self, socket, data) {
   global.db.engine.remove('users.messages', {})
 }
@@ -416,219 +614,5 @@ Users.prototype.resetWatchTime = function (self, socket, data) {
 Users.prototype.deleteViewer = function (self, socket, username) {
   global.users.delete(username)
 }
-
-/*
- * Will merge (rename) old user to new user (used in case of user rename) - no merging is done for simplicity
- * Usage: !merge -from oldusername -to newusername
 */
-Users.prototype.merge = async function (opts) {
-  let [fromUser, toUser] = [opts.parameters.match(/-from ([a-zA-Z0-9_]+)/), opts.parameters.match(/-to ([a-zA-Z0-9_]+)/)]
-
-  if (_.isNil(fromUser)) {
-    let message = await global.commons.prepare('merge.no-from-user-set')
-    debug(message); global.commons.sendMessage(message, opts.sender)
-    return
-  } else { fromUser = fromUser[1] }
-
-  if (_.isNil(toUser)) {
-    let message = await global.commons.prepare('merge.no-to-user-set')
-    debug(message); global.commons.sendMessage(message, opts.sender)
-    return
-  } else { toUser = toUser[1] }
-
-  let [toUserFromDb, fromUserFromDb] = await Promise.all([
-    global.db.engine.findOne('users', { username: toUser }),
-    global.db.engine.findOne('users', { username: fromUser })
-  ])
-
-  if (_.isEmpty(fromUserFromDb)) {
-    let message = await global.commons.prepare('merge.from-user-not-found', { fromUsername: fromUser })
-    debug(message); global.commons.sendMessage(message, opts.sender)
-    return
-  }
-
-  if (!_.isEmpty(toUserFromDb)) {
-    await Promise.all([
-      global.db.engine.remove('users', { _id: toUserFromDb._id.toString() }),
-      global.db.engine.update('users', { _id: fromUserFromDb._id.toString() }, { username: toUserFromDb.username }),
-      global.db.engine.update('users.points', { username: fromUserFromDb.username }, { username: toUserFromDb.username })
-    ])
-  } else {
-    await global.db.engine.update('users', { _id: fromUserFromDb._id.toString() }, { username: toUser })
-  }
-
-  let message = await global.commons.prepare('merge.user-merged', { fromUsername: fromUser, toUsername: toUser })
-  debug(message); global.commons.sendMessage(message, opts.sender)
-}
-
-Users.prototype.get = async function (username) {
-  username = username.toLowerCase()
-
-  let user = await global.db.engine.findOne('users', { username: username })
-
-  user.username = _.get(user, 'username', username).toLowerCase()
-  user.time = _.get(user, 'time', {})
-  user.is = _.get(user, 'is', {})
-  user.stats = _.get(user, 'stats', {})
-  user.custom = _.get(user, 'custom', {})
-
-  try {
-    if (!_.isNil(user._id)) user._id = user._id.toString() // force retype _id
-    if (_.isNil(user.time.created_at) && !_.isNil(user.id)) { // this is accessing master (in points) and worker
-      if (cluster.isMaster) global.api.fetchAccountAge(username, user.id)
-      else process.send({ type: 'api', fnc: 'fetchAccountAge', username: username, id: user.id })
-    }
-  } catch (e) {
-    global.log.error(e.stack)
-  }
-  return user
-}
-
-Users.prototype.getAll = async function (object) {
-  let users = await global.db.engine.find('users', object)
-  return users
-}
-
-Users.prototype.toggleIs = function (self, socket, data) {
-  let object = { is: {} }
-  object.is[data.type] = data.is
-  self.set(data.username, object)
-}
-
-Users.prototype.addRegular = function (opts) {
-  const username = opts.parameters.trim()
-
-  if (username.length === 0) {
-    global.commons.sendMessage(global.translate('regulars.add.empty'), opts.sender)
-    return false
-  }
-
-  if (!_.isNil(_.find(this.users, function (o) { return o.username === username }))) {
-    this.set(username, { is: { regular: true } })
-    global.commons.sendMessage(global.translate('regulars.add.success').replace(/\$username/g, username), opts.sender)
-  } else {
-    global.commons.sendMessage(global.translate('regulars.add.undefined').replace(/\$username/g, username), opts.sender)
-    return false
-  }
-}
-
-Users.prototype.rmRegular = function (opts) {
-  const username = opts.parameters.trim()
-
-  if (username.length === 0) {
-    global.commons.sendMessage(global.translate('regulars.rm.empty'), opts.sender)
-    return false
-  }
-
-  if (!_.isNil(_.find(this.users, function (o) { return o.username === username }))) {
-    this.set(username, { is: { regular: false } })
-    global.commons.sendMessage(global.translate('regulars.rm.success').replace(/\$username/g, username), opts.sender)
-  } else {
-    global.commons.sendMessage(global.translate('regulars.rm.undefined').replace(/\$username/g, username), opts.sender)
-    return false
-  }
-}
-
-Users.prototype.set = async function (username, object) {
-  if (_.isNil(username)) return global.log.error('username is NULL!\n' + new Error().stack)
-
-  username = username.toLowerCase()
-  if (username === config.settings.bot_username.toLowerCase() || _.isNil(username)) return // it shouldn't happen, but there can be more than one instance of a bot
-  return global.db.engine.update('users', { username: username }, object)
-}
-
-Users.prototype.setAll = async function (object) {
-  let result = await global.db.engine.update('users', {}, object)
-  return result
-}
-
-Users.prototype.delete = function (username) {
-  global.db.engine.remove('users', { username: username })
-}
-
-Users.prototype.updateWatchTime = async function () {
-  let timeout = 60000
-  try {
-    // count watching time when stream is online
-    if (await global.cache.isOnline()) {
-      let users = await global.db.engine.find('users.online')
-      let updated = []
-      for (let onlineUser of users) {
-        updated.push(onlineUser.username)
-        const watched = typeof this.watchedList[onlineUser.username] === 'undefined' ? timeout : new Date().getTime() - new Date(this.watchedList[onlineUser.username]).getTime()
-        await global.db.engine.insert('users.watched', { username: onlineUser.username, watched })
-        this.watchedList[onlineUser.username] = new Date()
-      }
-
-      // remove offline users from watched list
-      for (let u of Object.entries(this.watchedList)) {
-        if (!updated.includes(u[0])) delete this.watchedList[u[0]]
-      }
-    } else throw Error('stream offline')
-  } catch (e) {
-    this.watchedList = {}
-    timeout = 1000
-  }
-  return new Timeout().recursive({ this: this, uid: 'updateWatchTime', wait: timeout, fnc: this.updateWatchTime })
-}
-
-Users.prototype.compactWatchedDb = async function () {
-  try {
-    await global.commons.compactDb({ table: 'users.watched', index: 'username', values: 'watched' })
-  } catch (e) {
-    global.log.error(e)
-    global.log.error(e.stack)
-  } finally {
-    new Timeout().recursive({ uid: 'compactWatchedDb', this: this, fnc: this.compactWatchedDb, wait: 10000 })
-  }
-}
-
-Users.prototype.getWatchedOf = async function (user) {
-  let watched = 0
-  for (let item of await global.db.engine.find('users.watched', { username: user })) {
-    let itemPoints = !_.isNaN(parseInt(_.get(item, 'watched', 0))) ? _.get(item, 'watched', 0) : 0
-    watched = watched + Number(itemPoints)
-  }
-  if (Number(watched) < 0) watched = 0
-
-  return parseInt(
-    Number(watched) <= Number.MAX_SAFE_INTEGER / 1000000
-      ? watched
-      : Number.MAX_SAFE_INTEGER / 1000000, 10)
-}
-
-Users.prototype.compactMessagesDb = async function () {
-  try {
-    await global.commons.compactDb({ table: 'users.messages', index: 'username', values: 'messages' })
-  } catch (e) {
-    global.log.error(e)
-    global.log.error(e.stack)
-  } finally {
-    new Timeout().recursive({ uid: 'compactMessagesDb', this: this, fnc: this.compactMessagesDb, wait: 10000 })
-  }
-}
-
-Users.prototype.getMessagesOf = async function (user) {
-  let messages = 0
-  for (let item of await global.db.engine.find('users.messages', { username: user })) {
-    let itemPoints = !_.isNaN(parseInt(_.get(item, 'messages', 0))) ? _.get(item, 'messages', 0) : 0
-    messages = messages + Number(itemPoints)
-  }
-  if (Number(messages) < 0) messages = 0
-
-  return parseInt(
-    Number(messages) <= Number.MAX_SAFE_INTEGER / 1000000
-      ? messages
-      : Number.MAX_SAFE_INTEGER / 1000000, 10)
-}
-
-Users.prototype.getUsernamesFromIds = async function (IdsList) {
-  let IdsToUsername = {}
-  for (let id of IdsList) {
-    if (!_.isNil(IdsToUsername[id])) continue // skip if already had map
-    IdsToUsername[id] = (await global.db.engine.findOne('users', { id })).username
-  }
-  return IdsToUsername
-}
-
 module.exports = Users

@@ -128,7 +128,8 @@ function cluster () {
 
         if (!_.get(sender, 'isSubscriber', false) || !_.get(sender, 'isTurboSubscriber', false)) _.set(data, 'stats.tier', 0) // unset tier if sender is not subscriber
 
-        let user = await global.db.engine.findOne('users', { username: sender.username })
+        // update user based on id not username
+        let user = await global.db.engine.findOne('users', { id: sender.userId })
         if (_.isEmpty(user)) await global.db.engine.insert('users', data)
         else await global.db.engine.update('users', { _id: String(user._id) }, data)
 

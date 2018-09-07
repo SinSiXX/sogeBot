@@ -89,7 +89,7 @@ class API {
 
   async intervalFollowerUpdate () {
     for (let username of this.rate_limit_follower_check) {
-      const user = await global.users.get(username)
+      const user = await global.users.getByName(username)
       const isSkipped = user.username === config.settings.broadcaster_username || user.username === config.settings.bot_username.toLowerCase()
       const userHaveId = !_.isNil(user.id)
       if (new Date().getTime() - _.get(user, 'time.followCheck', 0) <= 1000 * 60 * 30 || isSkipped || !userHaveId) {
@@ -97,7 +97,7 @@ class API {
       }
     }
     if (this.rate_limit_follower_check.size > 0 && !_.isNil(global.overlays)) {
-      const user = await global.users.get(Array.from(this.rate_limit_follower_check)[0])
+      const user = await global.users.getByName(Array.from(this.rate_limit_follower_check)[0])
       this.rate_limit_follower_check.delete(user.username)
       await this.isFollowerUpdate(user)
     }
@@ -475,7 +475,7 @@ class API {
         }
 
         for (let follower of followersUsername) {
-          let user = await global.users.get(follower)
+          let user = await global.users.getByName(follower)
           if (!_.get(user, 'is.follower', false)) {
             if (new Date().getTime() - moment(_.get(user, 'time.follow', 0)).format('X') * 1000 < 60000 * 60 && !global.webhooks.existsInCache('follow', user.id)) {
               global.webhooks.addIdToCache('follow', user.id)
